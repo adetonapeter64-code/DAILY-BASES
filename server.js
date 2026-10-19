@@ -1,109 +1,409 @@
-// Money Making Machine - XAUUSD signal bot (RSI Pullback + EMA trend, 15M)
-// Env vars: TELEGRAM_BOT_TOKEN, TWELVE_DATA_KEY, optional TELEGRAM_CHAT_ID, RENDER_EXTERNAL_URL
+
+"use strict";
+
+// DAILY BASES v3.0.0
+// XAUUSD 15M RSI Pullback + EMA Trend
+//
+// Required environment variables:
+// TELEGRAM_BOT_TOKEN
+// TWELVE_DATA_KEY
+//
+// Optional:
+// TELEGRAM_CHAT_ID
+// RENDER_EXTERNAL_URL
+//
+// This is a signal and simulated-trade tracker.
+// It does not place broker orders.
+
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const fs = require("fs");
-const { CFG, evaluateAt, precompute } = require("./strategy");
+const path = require("path");
+
+const { CFG, evaluateAt, precompute, toMs } =
+  require("./strategy");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TD_KEY = process.env.TWELVE_DATA_KEY;
-const PORT = process.env.PORT || 3000;
-const DATA_FILE = "./data.json";
+const PORT = Number(process.env.PORT) || 3000;
+const DATA_FILE = path.join(__dirname, "data.json");
+
 const TF_MS = 15 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 if (!TOKEN || !TD_KEY) {
-  console.error("Missing TELEGRAM_BOT_TOKEN or TWELVE_DATA_KEY environment variable.");
+  console.error(
+    "Missing TELEGRAM_BOT_TOKEN or TWELVE_DATA_KEY."
+  );
   process.exit(1);
 }
 
-// ---------- storage (best effort; Render free disk resets on redeploy) ----------
-let db = { chats: [], state: { lastSignalMs: 0, countByDay: {} }, open: null, trades: [], lastSignal: null, lastEvaluated: "" };
-try { db = { ...db, ...JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) }; } catch (e) {}
-if (process.env.TELEGRAM_CHAT_ID && !db.chats.includes(process.env.TELEGRAM_CHAT_ID)) db.chats.push(process.env.TELEGRAM_CHAT_ID);
-const save = () => { try { fs.writeFileSync(DATA_FILE, JSON.stringify(db)); } catch (e) {} };
-
-const status = { lastCheck: null, lastCandle: null, error: null, nextCheck: null };
-
-// ---------- helpers ----------
-const toMs = (t) => Date.parse(t.replace(" ", "T") + "Z");
-const f2 = (n) => Number(n).toFixed(2);
-const bot = new TelegramBot(TOKEN, { polling: true });
-const KB = {
-  reply_markup: {
-    keyboard: [["💰 Live Price", "📈 XAUUSD Signal"], ["🩺 Signal Status", "📊 Stats"]],
-    resize_keyboard: true,
+const DEFAULT_DB = {
+  chats: [],
+  state: {
+    lastSignalMs: 0,
+    countByDay: {}
   },
+  open: null,
+  trades: [],
+  lastSignal: null,
+  lastEvaluated: ""
 };
-async function notify(text) {
-  for (const id of db.chats) {
-    try { await bot.sendMessage(id, text, KB); } catch (e) { console.error("send fail", id, e.message); }
+
+function loadDB() {
+  try {
+    const saved = JSON.parse(
+      fs.readFileSync(DATA_FILE, "utf8")
+    );
+
+    return {
+      ...DEFAULT_DB,
+      ...saved,
+      chats: Array.isArray(saved.chats) ? saved.chats : [],
+      trades: Array.isArray(saved.trades) ? saved.trades : [],
+      state: {
+        ...DEFAULT_DB.state,
+        ...(saved.state || {}),
+        countByDay: {
+          ...((saved.state || {}).countByDay || {})
+        }
+      }
+    };
+  } catch (_) {
+    return JSON.parse(JSON.stringify(DEFAULT_DB));
   }
 }
 
-// ---------- Twelve Data ----------
+let db = loadDB();
+
+if (process.env.TELEGRAM_CHAT_ID) {
+  const id = String(process.env.TELEGRAM_CHAT_ID);
+
+  if (!db.chats.includes(id)) {
+    db.chats.push(id);
+  }
+}
+
+function save() {
+  try {
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify(db, null, 2)
+    );
+  } catch (error) {
+    console.error("Storage warning:", error.message);
+  }
+}
+
+const status = {
+  startedAt: new Date().toISOString(),
+  lastCheck: null,
+  lastCandle: null,
+  error: null,
+  nextCheck: null
+};
+
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+const KB = {
+  reply_markup: {
+    keyboard: [
+      ["💰 Live Price", "📈 XAUUSD Signal"],
+      ["🩺 Signal Status", "📊 Stats"]
+    ],
+    resize_keyboard: true
+  }
+};
+
+const f2 = value => Number(value).toFixed(2);
+
+async function notify(message) {
+  for (const id of db.chats) {
+    try {
+      await bot.sendMessage(id, message, KB);
+    } catch (error) {
+      console.error(
+        "Telegram send failed for",
+        id,
+        error.message
+      );
+    }
+  }
+}
+
+// ---------------- MARKET DATA ----------------
+
+async function fetchJSON(url) {
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(20000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Market API HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
 async function fetchCandles() {
-  const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=15min&outputsize=300&timezone=UTC&apikey=${TD_KEY}`;
-  const j = await (await fetch(url)).json();
-  if (!j.values) throw new Error(j.message || "No data from Twelve Data");
+  const url =
+    "https://api.twelvedata.com/time_series" +
+    "?symbol=XAU/USD" +
+    "&interval=15min" +
+    "&outputsize=300" +
+    "&timezone=UTC" +
+    `&apikey=${encodeURIComponent(TD_KEY)}`;
+
+  const data = await fetchJSON(url);
+
+  if (!Array.isArray(data.values)) {
+    throw new Error(
+      data.message || data.code || "No candle data returned"
+    );
+  }
+
   const now = Date.now();
-  return j.values
-    .reverse()
-    .map((v) => ({ time: v.datetime, open: +v.open, high: +v.high, low: +v.low, close: +v.close }))
-    .filter((c) => toMs(c.time) + TF_MS <= now + 5000); // closed candles only
+
+  return data.values
+    .map(c => ({
+      time: c.datetime,
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close)
+    }))
+    .filter(c => {
+      const time = toMs(c.time);
+
+      return (
+        Number.isFinite(time) &&
+        time + TF_MS <= now + 1000 &&
+        Number.isFinite(c.open) &&
+        Number.isFinite(c.high) &&
+        Number.isFinite(c.low) &&
+        Number.isFinite(c.close) &&
+        c.high >= c.low
+      );
+    })
+    .sort((a, b) => toMs(a.time) - toMs(b.time));
 }
 
-let priceCache = { t: 0, p: null };
+let priceCache = {
+  time: 0,
+  price: null
+};
+
 async function fetchPrice() {
-  if (Date.now() - priceCache.t < 20000 && priceCache.p) return priceCache.p;
-  const j = await (await fetch(`https://api.twelvedata.com/price?symbol=XAU/USD&apikey=${TD_KEY}`)).json();
-  if (!j.price) throw new Error(j.message || "Price unavailable");
-  priceCache = { t: Date.now(), p: Number(j.price) };
-  return priceCache.p;
+  if (
+    priceCache.price !== null &&
+    Date.now() - priceCache.time < 20000
+  ) {
+    return priceCache.price;
+  }
+
+  const url =
+    "https://api.twelvedata.com/price" +
+    "?symbol=XAU/USD" +
+    `&apikey=${encodeURIComponent(TD_KEY)}`;
+
+  const data = await fetchJSON(url);
+  const price = Number(data.price);
+
+  if (!Number.isFinite(price)) {
+    throw new Error(data.message || "Price unavailable");
+  }
+
+  priceCache = {
+    time: Date.now(),
+    price
+  };
+
+  return price;
 }
 
-// ---------- trade tracking (demo log) ----------
-function finishTrade(o, r, why, closedTime, exit) {
-  db.trades.push({ ...o, r, why, closed: closedTime });
+// ---------------- TRADE TRACKING ----------------
+
+function finishTrade(trade, r, reason, time, exit) {
+  // Prevent duplicate closure if checks overlap.
+  if (!trade || db.open !== trade) return;
+
+  const closedTrade = {
+    ...trade,
+    r: Math.round(r * 100) / 100,
+    why: reason,
+    closed: time,
+    exit
+  };
+
+  db.trades.push(closedTrade);
   db.open = null;
-  const t = db.trades;
-  const wins = t.filter((x) => x.r > 0).length;
-  const net = t.reduce((a, x) => a + x.r, 0);
-  notify(
-    `${r > 0 ? "✅🎉" : r < 0 ? "❌😔" : "⚪"} TRADE CLOSED: ${why}\n` +
-    `🥇 XAUUSD ${o.side}\n📍 Entry: ${f2(o.entry)}\n🏁 Exit: ${f2(exit)}\n` +
-    `💵 Result: ${r > 0 ? "+" : ""}${r}R\n\n` +
-    `📊 Total: ${t.length} trades | Win rate ${Math.round((wins / t.length) * 100)}% | Net ${net.toFixed(2)}R`
-  );
+
+  // Keep the file manageable.
+  if (db.trades.length > 2000) {
+    db.trades = db.trades.slice(-2000);
+  }
+
   save();
+
+  const wins = db.trades.filter(t => t.r > 0).length;
+  const net = db.trades.reduce((sum, t) => sum + t.r, 0);
+  const winRate = db.trades.length
+    ? Math.round(wins / db.trades.length * 100)
+    : 0;
+
+  notify(
+    `${r > 0 ? "✅🏆 WIN" : r < 0 ? "❌ LOSS" : "⚪ BREAK EVEN"}` +
+    ` — DAILY BASES\n\n` +
+    `🥇 XAUUSD ${trade.side}\n` +
+    `📍 Entry: ${f2(trade.entry)}\n` +
+    `🏁 Exit: ${f2(exit)}\n` +
+    `📌 Reason: ${reason}\n` +
+    `💵 Result: ${r > 0 ? "+" : ""}${r.toFixed(2)}R\n\n` +
+    `📊 Closed trades: ${db.trades.length}\n` +
+    `🎯 Win rate: ${winRate}%\n` +
+    `📈 Net result: ${net.toFixed(2)}R\n` +
+    `🧪 Simulated tracking; not broker-confirmed.`
+  );
 }
 
 function resolveOpen(candles) {
-  const o = db.open;
-  if (!o) return;
-  for (const c of candles) {
-    if (toMs(c.time) <= toMs(o.time)) continue;
-    const hitSL = o.side === "BUY" ? c.low <= o.sl : c.high >= o.sl;
-    const hitTP = o.side === "BUY" ? c.high >= o.tp : c.low <= o.tp;
-    let r = null, why = "";
-    if (hitSL) { r = -1; why = "STOP LOSS"; }
-    else if (hitTP) { r = CFG.rr; why = "TAKE PROFIT"; }
-    else if (toMs(c.time) - toMs(o.time) > 24 * 3600 * 1000) {
-      const dir = o.side === "BUY" ? 1 : -1;
-      r = Math.round(((c.close - o.entry) * dir / Math.abs(o.entry - o.sl)) * 100) / 100;
-      why = "EXPIRED (24h)";
+  const trade = db.open;
+  if (!trade) return;
+
+  const openTime = toMs(trade.time);
+
+  for (const candle of candles) {
+    const candleTime = toMs(candle.time);
+
+    if (candleTime <= openTime) continue;
+
+    const hitSL = trade.side === "BUY"
+      ? candle.low <= trade.sl
+      : candle.high >= trade.sl;
+
+    const hitTP = trade.side === "BUY"
+      ? candle.high >= trade.tp
+      : candle.low <= trade.tp;
+
+    // If both are touched in one candle, assume SL first.
+    // OHLC candles cannot tell us the true intrabar order.
+    if (hitSL) {
+      finishTrade(
+        trade, -1, hitTP ? "SL & TP SAME CANDLE (SL ASSUMED FIRST)" : "STOP LOSS",
+        candle.time, trade.sl
+      );
+      return;
     }
-    if (r !== null) {
-      const exit = hitSL ? o.sl : hitTP ? o.tp : c.close;
-      finishTrade(o, r, why, c.time, exit);
+
+    if (hitTP) {
+      finishTrade(
+        trade, CFG.rr, "TAKE PROFIT",
+        candle.time, trade.tp
+      );
+      return;
+    }
+
+    if (candleTime - openTime >= DAY_MS) {
+      const direction = trade.side === "BUY" ? 1 : -1;
+      const risk = Math.abs(trade.entry - trade.sl);
+
+      const r = risk > 0
+        ? ((candle.close - trade.entry) * direction) / risk
+        : 0;
+
+      finishTrade(
+        trade, r, "EXPIRED AFTER 24 HOURS",
+        candle.time, candle.close
+      );
       return;
     }
   }
 }
 
+async function checkProximity() {
+  const trade = db.open;
+  if (!trade) return;
+
+  try {
+    const price = await fetchPrice();
+
+    // The quote endpoint may differ from the candle feed.
+    // This is a monitoring estimate, not broker execution.
+    const direction = trade.side === "BUY" ? 1 : -1;
+    const risk = Math.abs(trade.entry - trade.sl);
+    const reward = Math.abs(trade.tp - trade.entry);
+
+    if (!risk || !reward) return;
+
+    const toSL =
+      ((trade.entry - price) * direction) / risk;
+
+    const toTP =
+      ((price - trade.entry) * direction) / reward;
+
+    if (toSL >= 1) {
+      finishTrade(
+        trade, -1, "STOP LOSS (LIVE PRICE CHECK)",
+        new Date().toISOString(), trade.sl
+      );
+      return;
+    }
+
+    if (toTP >= 1) {
+      finishTrade(
+        trade, CFG.rr, "TAKE PROFIT (LIVE PRICE CHECK)",
+        new Date().toISOString(), trade.tp
+      );
+      return;
+    }
+
+    if (toSL >= 0.7 && !trade.warnSL) {
+      trade.warnSL = true;
+
+      notify(
+        `⚠️ DAILY BASES — SL WARNING\n` +
+        `XAUUSD ${trade.side}\n` +
+        `💰 Current quote: ${f2(price)}\n` +
+        `📍 Entry: ${f2(trade.entry)}\n` +
+        `🛑 SL: ${f2(trade.sl)}`
+      );
+
+      save();
+    }
+
+    if (toTP >= 0.8 && !trade.warnTP) {
+      trade.warnTP = true;
+
+      notify(
+        `🎯 DAILY BASES — TP APPROACHING\n` +
+        `XAUUSD ${trade.side}\n` +
+        `💰 Current quote: ${f2(price)}\n` +
+        `🏁 TP: ${f2(trade.tp)}`
+      );
+
+      save();
+    }
+  } catch (error) {
+    console.error("Proximity check failed:", error.message);
+  }
+}
+
+// ---------------- SIGNAL ENGINE ----------------
+
+let checking = false;
+
 async function runCheck() {
+  if (checking) return;
+
+  checking = true;
+
   try {
     const candles = await fetchCandles();
-    if (candles.length < 120) throw new Error("Not enough candle data yet");
+
+    if (candles.length < CFG.emaSlow + 10) {
+      throw new Error("Not enough closed candles for analysis");
+    }
+
     const last = candles[candles.length - 1];
     status.lastCheck = new Date().toISOString();
     status.lastCandle = last.time;
@@ -111,136 +411,259 @@ async function runCheck() {
 
     resolveOpen(candles);
 
-    if (!db.open && db.lastEvaluated !== last.time) {
+    // One evaluation per closed candle.
+    if (
+      !db.open &&
+      db.lastEvaluated !== last.time
+    ) {
+      // Save evaluation marker so repeated checks do not
+      // produce duplicate signals for the same candle.
       db.lastEvaluated = last.time;
-      const s = evaluateAt(candles, candles.length - 1, db.state, CFG, precompute(candles));
-      if (s) {
-        db.state.lastSignalMs = toMs(s.time);
-        const day = s.time.slice(0, 10);
-        db.state.countByDay[day] = (db.state.countByDay[day] || 0) + 1;
-        db.open = s;
-        db.lastSignal = s;
-        notify(
-          `🔔 NEW SIGNAL ${s.side === "BUY" ? "🟢📈" : "🔴📉"}\n` +
-          `🥇 XAUUSD ${s.side} (15M)\n📍 Entry: ${f2(s.entry)}\n🛑 Stop Loss: ${f2(s.sl)}\n🎯 Take Profit: ${f2(s.tp)}\n` +
-          `⚖️ RR 1:${CFG.rr} | RSI ${s.rsi} | ATR ${s.atr}\n🕒 Candle: ${s.time} UTC`
+
+      const indicators = precompute(candles, CFG);
+
+      const signal = evaluateAt(
+        candles,
+        candles.length - 1,
+        db.state,
+        CFG,
+        indicators
+      );
+
+      if (signal) {
+        db.state.lastSignalMs = toMs(signal.time);
+
+        const day = signal.time.slice(0, 10);
+
+        db.state.countByDay[day] =
+          (db.state.countByDay[day] || 0) + 1;
+
+        db.open = signal;
+        db.lastSignal = signal;
+
+        save();
+
+        await notify(
+          `🔔 DAILY BASES — NEW SIGNAL\n\n` +
+          `${signal.side === "BUY" ? "🟢 BUY 📈" : "🔴 SELL 📉"} XAUUSD (15M)\n` +
+          `📍 Entry: ${f2(signal.entry)}\n` +
+          `🛑 Stop Loss: ${f2(signal.sl)}\n` +
+          `🎯 Take Profit: ${f2(signal.tp)}\n` +
+          `⚖️ Risk:Reward = 1:${CFG.rr}\n` +
+          `📊 RSI: ${signal.rsi}\n` +
+          `📏 ATR: ${signal.atr}\n` +
+          `🕒 Candle: ${signal.time} UTC\n\n` +
+          `🧪 Simulated signal. Verify before trading.`
         );
       }
     }
+
     save();
-  } catch (e) {
-    status.error = e.message;
+  } catch (error) {
+    status.error = error.message;
     status.lastCheck = new Date().toISOString();
-    console.error("check failed:", e.message);
+
+    console.error("DAILY BASES check failed:", error.message);
+  } finally {
+    checking = false;
   }
 }
 
-// While a trade is open, check live price every 3 min and warn if it nears SL or TP
-async function checkProximity() {
-  const o = db.open;
-  if (!o) return;
-  try {
-    const p = await fetchPrice();
-    const dir = o.side === "BUY" ? 1 : -1;
-    const toSL = ((o.entry - p) * dir) / Math.abs(o.entry - o.sl);   // 1 = at stop loss
-    const toTP = ((p - o.entry) * dir) / Math.abs(o.tp - o.entry);   // 1 = at take profit
-    if (toSL >= 1) return finishTrade(o, -1, "STOP LOSS", new Date().toISOString(), o.sl);
-    if (toTP >= 1) return finishTrade(o, CFG.rr, "TAKE PROFIT", new Date().toISOString(), o.tp);
-    if (toSL >= 0.7 && !o.warnSL) {
-      o.warnSL = true;
-      notify(
-        `⚠️🚨 WARNING: ${o.side} signal is close to being dropped!\n` +
-        `💰 Price now: ${f2(p)}\n🛑 Stop Loss: ${f2(o.sl)}\n📍 Entry: ${f2(o.entry)}\n` +
-        `Consider protecting your trade 🛡️`
-      );
-    }
-    if (toTP >= 0.8 && !o.warnTP) {
-      o.warnTP = true;
-      notify(`🎯🔥 ${o.side} is almost at Take Profit!\n💰 Price now: ${f2(p)}\n🎯 Target: ${f2(o.tp)}`);
-    }
-    save();
-  } catch (e) {}
-}
-setInterval(checkProximity, 3 * 60 * 1000);
+// ---------------- TELEGRAM MENUS ----------------
 
-// check once, ~10s after each 15M candle closes (96 calls/day, fine for free tier)
-let lastBoundary = 0;
-setInterval(() => {
-  const now = Date.now();
-  const b = Math.floor(now / TF_MS);
-  status.nextCheck = new Date((b + 1) * TF_MS + 10000).toISOString();
-  if (b !== lastBoundary && now - b * TF_MS >= 10000) {
-    lastBoundary = b;
-    runCheck();
-  }
-}, 5000);
-runCheck();
-
-// ---------- Telegram handlers ----------
 function statsText() {
-  const t = db.trades;
-  if (!t.length) return "📊 No closed trades yet ⏳";
-  const wins = t.filter((x) => x.r > 0).length;
-  const net = t.reduce((a, x) => a + x.r, 0);
-  const lastFive = t.slice(-5).map((x) => `${x.side} ${x.r > 0 ? "+" : ""}${x.r}R`).join("\n");
-  return `📊 Demo stats\nTrades: ${t.length}\nWin rate: ${Math.round((wins / t.length) * 100)}% (need >33% at 1:${CFG.rr})\nNet: ${net.toFixed(2)}R\n\nLast trades:\n${lastFive}`;
+  const trades = db.trades;
+  const wins = trades.filter(t => t.r > 0).length;
+  const losses = trades.filter(t => t.r < 0).length;
+  const net = trades.reduce((sum, t) => sum + t.r, 0);
+
+  const winRate = trades.length
+    ? Math.round(wins / trades.length * 100)
+    : 0;
+
+  const recent = trades.slice(-5).reverse();
+
+  const lastTrades = recent.length
+    ? recent.map(t =>
+        `${t.side} ${t.r > 0 ? "+" : ""}${t.r.toFixed(2)}R — ${t.why}`
+      ).join("\n")
+    : "No closed trades yet.";
+
+  return (
+    `📊 DAILY BASES — SIMULATED STATS\n\n` +
+    `Closed trades: ${trades.length}\n` +
+    `🏆 Wins: ${wins}\n` +
+    `❌ Losses: ${losses}\n` +
+    `🎯 Win rate: ${winRate}%\n` +
+    `📈 Net: ${net.toFixed(2)}R\n` +
+    `🟡 Active: ${db.open ? db.open.side : "None"}\n\n` +
+    `Recent trades:\n${lastTrades}\n\n` +
+    `Results are not broker-confirmed.`
+  );
 }
 
 function signalText() {
   if (db.open) {
-    const o = db.open;
-    return `${o.side === "BUY" ? "🟢📈" : "🔴📉"} ACTIVE ${o.side} XAUUSD\n📍 Entry: ${f2(o.entry)}\n🛑 SL: ${f2(o.sl)}\n🎯 TP: ${f2(o.tp)}\n🕒 Opened: ${o.time} UTC`;
+    const trade = db.open;
+
+    return (
+      `📡 DAILY BASES — ACTIVE SIGNAL\n\n` +
+      `${trade.side === "BUY" ? "🟢 BUY" : "🔴 SELL"} XAUUSD (15M)\n` +
+      `📍 Entry: ${f2(trade.entry)}\n` +
+      `🛑 SL: ${f2(trade.sl)}\n` +
+      `🎯 TP: ${f2(trade.tp)}\n` +
+      `🕒 Opened: ${trade.time} UTC`
+    );
   }
+
   if (db.lastSignal) {
-    const s = db.lastSignal;
-    return `😴 No active signal right now.\n🕘 Last: ${s.side} at ${f2(s.entry)} (${s.time} UTC)`;
+    return (
+      `😴 No active signal.\n\n` +
+      `Last signal: ${db.lastSignal.side}\n` +
+      `Entry: ${f2(db.lastSignal.entry)}\n` +
+      `Candle: ${db.lastSignal.time} UTC`
+    );
   }
-  return "🔍 No signal yet. I check after every 15M candle closes ⏱️";
+
+  return "🔍 No signal recorded yet. DAILY BASES checks closed 15M candles.";
 }
 
 function statusText() {
-  const h = new Date().getUTCHours();
-  const inSession = h >= CFG.sessionStartUTC && h < CFG.sessionEndUTC;
-  const today = new Date().toISOString().slice(0, 10);
+  const hour = new Date().getUTCHours();
+  const sessionOpen =
+    hour >= CFG.sessionStartUTC &&
+    hour < CFG.sessionEndUTC;
+
+  const day = new Date().toISOString().slice(0, 10);
+
   return (
-    `🩺 Signal checking status\n` +
-    `Data: ${status.error ? "❌ " + status.error : "✅ OK"}\n` +
-    `Last check: ${status.lastCheck || "not yet"}\n` +
-    `Last closed candle: ${status.lastCandle || "n/a"} UTC\n` +
-    `Next check: ${status.nextCheck || "soon"}\n` +
-    `Session (${CFG.sessionStartUTC}:00-${CFG.sessionEndUTC}:00 UTC): ${inSession ? "🟢 open" : "⚪ closed"}\n` +
-    `Signals today: ${db.state.countByDay[today] || 0}/${CFG.maxPerDay}\n` +
-    `Open trade: ${db.open ? db.open.side : "none"}`
+    `🩺 DAILY BASES — STATUS\n\n` +
+    `Market data: ${status.error ? "❌ " + status.error : "✅ OK"}\n` +
+    `Last check: ${status.lastCheck || "Not yet"}\n` +
+    `Last candle: ${status.lastCandle || "N/A"} UTC\n` +
+    `Next check: ${status.nextCheck || "Pending"}\n` +
+    `Session: ${sessionOpen ? "🟢 Open" : "⚪ Closed"} UTC\n` +
+    `Session hours: ${CFG.sessionStartUTC}:00–${CFG.sessionEndUTC}:00 UTC\n` +
+    `Signals today: ${db.state.countByDay[day] || 0}/${CFG.maxPerDay}\n` +
+    `Active trade: ${db.open ? db.open.side : "None"}\n` +
+    `Telegram chats: ${db.chats.length}`
   );
 }
 
-bot.on("message", async (msg) => {
-  const id = String(msg.chat.id);
-  const text = (msg.text || "").trim();
-  if (!db.chats.includes(id)) { db.chats.push(id); save(); }
+bot.on("message", async message => {
+  const id = String(message.chat.id);
+  const text = (message.text || "").trim();
+
+  if (!db.chats.includes(id)) {
+    db.chats.push(id);
+    save();
+  }
+
   try {
     if (text === "/start") {
-      return bot.sendMessage(id, "🚀 Money Making Machine is running ✅\n📊 Strategy: RSI pullback + EMA trend (15M XAUUSD)\n📩 Signals will be sent to you automatically.\n⚠️ You will get a warning if a signal is close to its stop loss.", KB);
+      return bot.sendMessage(
+        id,
+        `🚀 Welcome to DAILY BASES!\n\n` +
+        `📊 Strategy: RSI pullback + EMA trend\n` +
+        `🥇 Market: XAUUSD\n` +
+        `⏱ Timeframe: 15 minutes\n` +
+        `📩 Automatic signal notifications are enabled.\n\n` +
+        `⚠️ Signals are not guaranteed to be profitable.`,
+        KB
+      );
     }
+
     if (text === "💰 Live Price" || text === "/price") {
-      const p = await fetchPrice();
-      return bot.sendMessage(id, `💰 XAUUSD: ${f2(p)}`, KB);
+      const price = await fetchPrice();
+
+      return bot.sendMessage(
+        id, `💰 XAUUSD: ${f2(price)}`, KB
+      );
     }
-    if (text === "📈 XAUUSD Signal" || text === "/signal") return bot.sendMessage(id, signalText(), KB);
-    if (text === "🩺 Signal Status" || text === "/status") return bot.sendMessage(id, statusText(), KB);
-    if (text === "📊 Stats" || text === "/stats") return bot.sendMessage(id, statsText(), KB);
-    return bot.sendMessage(id, "🤖 Please use the buttons below 👇\nI send signals to you automatically 📩", KB);
-  } catch (e) {
-    bot.sendMessage(id, "⚠️📡 Market data unavailable: " + e.message, KB);
+
+    if (text === "📈 XAUUSD Signal" || text === "/signal") {
+      return bot.sendMessage(id, signalText(), KB);
+    }
+
+    if (text === "🩺 Signal Status" || text === "/status") {
+      return bot.sendMessage(id, statusText(), KB);
+    }
+
+    if (text === "📊 Stats" || text === "/stats") {
+      return bot.sendMessage(id, statsText(), KB);
+    }
+
+    return bot.sendMessage(
+      id,
+      "🤖 Use the DAILY BASES buttons below.",
+      KB
+    );
+  } catch (error) {
+    return bot.sendMessage(
+      id,
+      `⚠️ Market data unavailable: ${error.message}`,
+      KB
+    );
   }
 });
-bot.on("polling_error", (e) => console.error("polling error:", e.message));
 
-// ---------- web server + keep-alive for Render ----------
-const app = express();
-app.get("/", (req, res) => res.send("Money Making Machine is running"));
-app.get("/health", (req, res) => res.json({ ok: true, ...status }));
-app.listen(PORT, () => console.log("Listening on", PORT));
-if (process.env.RENDER_EXTERNAL_URL) {
-  setInterval(() => fetch(process.env.RENDER_EXTERNAL_URL + "/health").catch(() => {}), 10 * 60 * 1000);
+bot.on("polling_error", error => {
+  console.error("Telegram polling error:", error.message);
+});
+
+// ---------------- SCHEDULING ----------------
+
+// Check shortly after the next 15-minute boundary.
+// This avoids fetching candles every few seconds.
+
+function scheduleNextCheck(delayOverride) {
+  const now = Date.now();
+  const nextBoundary =
+    (Math.floor(now / TF_MS) + 1) * TF_MS + 12000;
+
+  const delay = Number.isFinite(delayOverride)
+    ? delayOverride
+    : Math.max(1000, nextBoundary - now);
+
+  status.nextCheck = new Date(now + delay).toISOString();
+
+  setTimeout(async () => {
+    await runCheck();
+
+    // Retry temporary API failures after one minute.
+    scheduleNextCheck(status.error ? 60000 : undefined);
+  }, delay);
 }
+
+setInterval(checkProximity, 3 * 60 * 1000);
+
+const app = express();
+
+app.get("/", (req, res) => {
+  res.send("DAILY BASES is running.");
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    name: "DAILY BASES",
+    ok: !status.error,
+    ...status,
+    activeTrade: db.open ? db.open.side : null,
+    closedTrades: db.trades.length
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`DAILY BASES listening on port ${PORT}`);
+});
+
+if (process.env.RENDER_EXTERNAL_URL) {
+  setInterval(() => {
+    fetch(
+      process.env.RENDER_EXTERNAL_URL.replace(/\/$/, "") +
+      "/health"
+    ).catch(() => {});
+  }, 10 * 60 * 1000);
+}
+
+runCheck().finally(() => scheduleNextCheck());
