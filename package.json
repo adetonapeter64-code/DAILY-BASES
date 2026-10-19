@@ -1,10 +1,12 @@
+
 {
-  "name": "money-making-machine-bot",
-  "version": "2.0.0",
-  "description": "XAUUSD Telegram signal bot - RSI pullback + EMA trend",
+  "name": "daily-bases",
+  "version": "3.0.0",
+  "description": "DAILY BASES - XAUUSD Telegram signal bot",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "backtest": "node backtest.js"
   },
   "engines": {
     "node": ">=18"
