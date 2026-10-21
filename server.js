@@ -653,6 +653,102 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.use(express.urlencoded({ extended: false }));
+
+app.get("/backtest-download", (req, res) => {
+  res.type("html").send(`
+    <!doctype html>
+    <html>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>DAILY BASES Data Export</title>
+      <body style="font-family:Arial;padding:24px">
+        <h2>📊 XAUUSD Historical Data</h2>
+        <p>Enter your private export secret to download candles.</p>
+        <form method="POST" action="/backtest-download">
+          <input type="password" name="secret"
+            placeholder="Export secret" required
+            style="padding:12px;width:90%">
+          <p><button style="padding:12px">Download candles</button></p>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+app.post("/backtest-download", async (req, res) => {
+  const supplied = req.body && req.body.secret;
+  const expected = process.env.BACKTEST_SECRET;
+
+  if (!expected || typeof supplied !== "string" ||
+      supplied.length !== expected.length ||
+      supplied !== expected) {
+    return res.status(401).send("Unauthorized.");
+  }
+
+  try {
+    const url = new URL(
+      "https://api.twelvedata.com/time_series"
+    );
+
+    url.searchParams.set("symbol", "XAU/USD");
+    url.searchParams.set("interval", "15min");
+    url.searchParams.set("outputsize", "5000");
+    url.searchParams.set("timezone", "UTC");
+    url.searchParams.set("apikey", TD_KEY);
+
+    const data = await fetchJSON(url.toString());
+
+    if (!Array.isArray(data.values)) {
+      throw new Error(
+        data.message || "Historical candles unavailable."
+      );
+    }
+
+    const candles = data.values
+      .map(c => ({
+        time: c.datetime,
+        open: Number(c.open),
+        high: Number(c.high),
+        low: Number(c.low),
+        close: Number(c.close)
+      }))
+      .filter(c => {
+        const t = toMs(c.time);
+
+        return Number.isFinite(t) &&
+          t + TF_MS <= Date.now() &&
+          [c.open, c.high, c.low, c.close]
+            .every(Number.isFinite) &&
+          c.high >= Math.max(c.open, c.close, c.low) &&
+          c.low <= Math.min(c.open, c.close, c.high);
+      })
+      .sort((a, b) => toMs(a.time) - toMs(b.time));
+
+    if (candles.length < 150) {
+      throw new Error(
+        `Only ${candles.length} closed candles available.`
+      );
+    }
+
+    res.setHeader(
+      "Content-Type",
+      "application/json; charset=utf-8"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="candles.json"'
+    );
+
+    res.send(JSON.stringify(candles, null, 2));
+  } catch (error) {
+    console.error("Historical export failed:", error.message);
+    res.status(502).send(
+      "Export failed. Check Render logs and Twelve Data API access."
+    );
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`DAILY BASES listening on port ${PORT}`);
 });
