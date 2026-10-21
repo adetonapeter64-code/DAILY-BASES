@@ -11,6 +11,7 @@
 // Optional:
 // TELEGRAM_CHAT_ID
 // RENDER_EXTERNAL_URL
+// BACKTEST_SECRET - required for historical candle export
 //
 // This is a signal and simulated-trade tracker.
 // It does not place broker orders.
@@ -19,12 +20,14 @@ const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const { CFG, evaluateAt, precompute, toMs } =
   require("./strategy");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TD_KEY = process.env.TWELVE_DATA_KEY;
+const BACKTEST_SECRET = process.env.BACKTEST_SECRET;
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_FILE = path.join(__dirname, "data.json");
 
@@ -182,7 +185,9 @@ async function fetchCandles() {
         Number.isFinite(c.high) &&
         Number.isFinite(c.low) &&
         Number.isFinite(c.close) &&
-        c.high >= c.low
+        c.high >= c.low &&
+        c.high >= Math.max(c.open, c.close) &&
+        c.low <= Math.min(c.open, c.close)
       );
     })
     .sort((a, b) => toMs(a.time) - toMs(b.time));
@@ -224,7 +229,6 @@ async function fetchPrice() {
 // ---------------- TRADE TRACKING ----------------
 
 function finishTrade(trade, r, reason, time, exit) {
-  // Prevent duplicate closure if checks overlap.
   if (!trade || db.open !== trade) return;
 
   const closedTrade = {
@@ -238,7 +242,6 @@ function finishTrade(trade, r, reason, time, exit) {
   db.trades.push(closedTrade);
   db.open = null;
 
-  // Keep the file manageable.
   if (db.trades.length > 2000) {
     db.trades = db.trades.slice(-2000);
   }
@@ -285,12 +288,15 @@ function resolveOpen(candles) {
       ? candle.high >= trade.tp
       : candle.low <= trade.tp;
 
-    // If both are touched in one candle, assume SL first.
-    // OHLC candles cannot tell us the true intrabar order.
     if (hitSL) {
       finishTrade(
-        trade, -1, hitTP ? "SL & TP SAME CANDLE (SL ASSUMED FIRST)" : "STOP LOSS",
-        candle.time, trade.sl
+        trade,
+        -1,
+        hitTP
+          ? "SL & TP SAME CANDLE (SL ASSUMED FIRST)"
+          : "STOP LOSS",
+        candle.time,
+        trade.sl
       );
       return;
     }
@@ -327,8 +333,6 @@ async function checkProximity() {
   try {
     const price = await fetchPrice();
 
-    // The quote endpoint may differ from the candle feed.
-    // This is a monitoring estimate, not broker execution.
     const direction = trade.side === "BUY" ? 1 : -1;
     const risk = Math.abs(trade.entry - trade.sl);
     const reward = Math.abs(trade.tp - trade.entry);
@@ -411,13 +415,10 @@ async function runCheck() {
 
     resolveOpen(candles);
 
-    // One evaluation per closed candle.
     if (
       !db.open &&
       db.lastEvaluated !== last.time
     ) {
-      // Save evaluation marker so repeated checks do not
-      // produce duplicate signals for the same candle.
       db.lastEvaluated = last.time;
 
       const indicators = precompute(candles, CFG);
@@ -613,9 +614,6 @@ bot.on("polling_error", error => {
 
 // ---------------- SCHEDULING ----------------
 
-// Check shortly after the next 15-minute boundary.
-// This avoids fetching candles every few seconds.
-
 function scheduleNextCheck(delayOverride) {
   const now = Date.now();
   const nextBoundary =
@@ -629,15 +627,20 @@ function scheduleNextCheck(delayOverride) {
 
   setTimeout(async () => {
     await runCheck();
-
-    // Retry temporary API failures after one minute.
     scheduleNextCheck(status.error ? 60000 : undefined);
   }, delay);
 }
 
 setInterval(checkProximity, 3 * 60 * 1000);
 
+// ---------------- EXPRESS SERVER ----------------
+
 const app = express();
+
+app.use(express.urlencoded({
+  extended: false,
+  limit: "2kb"
+}));
 
 app.get("/", (req, res) => {
   res.send("DAILY BASES is running.");
@@ -653,22 +656,32 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.use(express.urlencoded({ extended: false }));
-
+// Show the password form. The secret is never put in the URL.
 app.get("/backtest-download", (req, res) => {
   res.type("html").send(`
     <!doctype html>
-    <html>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>DAILY BASES Data Export</title>
-      <body style="font-family:Arial;padding:24px">
+    <html lang="en">
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>DAILY BASES Data Export</title>
+      </head>
+      <body style="font-family:Arial,sans-serif;padding:24px;max-width:600px;margin:auto">
         <h2>📊 XAUUSD Historical Data</h2>
-        <p>Enter your private export secret to download candles.</p>
+        <p>Enter your private export secret to download closed 15-minute candles.</p>
         <form method="POST" action="/backtest-download">
-          <input type="password" name="secret"
-            placeholder="Export secret" required
-            style="padding:12px;width:90%">
-          <p><button style="padding:12px">Download candles</button></p>
+          <input
+            type="password"
+            name="secret"
+            placeholder="Export secret"
+            autocomplete="current-password"
+            required
+            style="box-sizing:border-box;padding:12px;width:100%"
+          >
+          <p>
+            <button type="submit" style="padding:12px 18px">
+              Download candles
+            </button>
+          </p>
         </form>
       </body>
     </html>
@@ -677,11 +690,18 @@ app.get("/backtest-download", (req, res) => {
 
 app.post("/backtest-download", async (req, res) => {
   const supplied = req.body && req.body.secret;
-  const expected = process.env.BACKTEST_SECRET;
+  const expected = BACKTEST_SECRET;
 
-  if (!expected || typeof supplied !== "string" ||
-      supplied.length !== expected.length ||
-      supplied !== expected) {
+  if (
+    !expected ||
+    typeof supplied !== "string" ||
+    Buffer.byteLength(supplied, "utf8") !==
+      Buffer.byteLength(expected, "utf8") ||
+    !crypto.timingSafeEqual(
+      Buffer.from(supplied, "utf8"),
+      Buffer.from(expected, "utf8")
+    )
+  ) {
     return res.status(401).send("Unauthorized.");
   }
 
@@ -699,10 +719,18 @@ app.post("/backtest-download", async (req, res) => {
     const data = await fetchJSON(url.toString());
 
     if (!Array.isArray(data.values)) {
-      throw new Error(
-        data.message || "Historical candles unavailable."
+      console.error(
+        "Historical data provider error:",
+        data.message || data.code || "No candle data"
+      );
+
+      return res.status(502).send(
+        "Twelve Data did not return historical candles. " +
+        "Check your API plan and Render logs."
       );
     }
+
+    const now = Date.now();
 
     const candles = data.values
       .map(c => ({
@@ -715,18 +743,21 @@ app.post("/backtest-download", async (req, res) => {
       .filter(c => {
         const t = toMs(c.time);
 
-        return Number.isFinite(t) &&
-          t + TF_MS <= Date.now() &&
+        return (
+          Number.isFinite(t) &&
+          t + TF_MS <= now &&
           [c.open, c.high, c.low, c.close]
             .every(Number.isFinite) &&
           c.high >= Math.max(c.open, c.close, c.low) &&
-          c.low <= Math.min(c.open, c.close, c.high);
+          c.low <= Math.min(c.open, c.close, c.high)
+        );
       })
       .sort((a, b) => toMs(a.time) - toMs(b.time));
 
     if (candles.length < 150) {
-      throw new Error(
-        `Only ${candles.length} closed candles available.`
+      return res.status(502).send(
+        `Only ${candles.length} closed candles were returned. ` +
+        "Check historical data access on your Twelve Data plan."
       );
     }
 
@@ -734,20 +765,26 @@ app.post("/backtest-download", async (req, res) => {
       "Content-Type",
       "application/json; charset=utf-8"
     );
+
     res.setHeader(
       "Content-Disposition",
       'attachment; filename="candles.json"'
     );
 
-    res.send(JSON.stringify(candles, null, 2));
+    res.setHeader("Cache-Control", "no-store");
+
+    return res.send(JSON.stringify(candles, null, 2));
   } catch (error) {
-    console.error("Historical export failed:", error.message);
-    res.status(502).send(
-      "Export failed. Check Render logs and Twelve Data API access."
+    console.error(
+      "Historical export failed:",
+      error.message
+    );
+
+    return res.status(502).send(
+      "Historical export failed. Check Render logs and Twelve Data access."
     );
   }
 });
-
 
 app.listen(PORT, () => {
   console.log(`DAILY BASES listening on port ${PORT}`);
