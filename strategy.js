@@ -1,217 +1,404 @@
+
 "use strict";
 
-// XAUUSD STRICT SNIPER v1.0
-// Rule-based multi-timeframe strategy:
-// M15 trend -> M5 liquidity sweep + structure shift + displacement/FVG
-// -> M1 FVG retest + candle confirmation.
-// Candles must be closed and sorted oldest to newest. Times are UTC.
+// 🤖 BOT.XAU SNIPER ENTRY
+// XAUUSD ONLY — M5 LIQUIDITY / MSS STRATEGY
+//
+// 1. Identify liquidity.
+// 2. Wait for a liquidity sweep.
+// 3. Determine direction from the sweep.
+// 4. Wait for MSS.
+// 5. Find the last opposing candle before MSS.
+// 6. Entry at 50% of that candle; SL beyond its extreme.
+// 7. TP at opposing-side liquidity.
+// 8. Track the simulated trade until TP or SL.
+//
+// Candles: closed, oldest to newest. Times are UTC.
 
 const CFG = {
-  rr: 3,
-  sessionStartUTC: 7,
-  sessionEndUTC: 20,
+  timeframe: "5min",
+  swingLookback: 30,
+  mssLookback: 8,
+  sweepSearchBars: 8,
+  opposingCandleSearchBars: 8,
+  liquidityLookback: 80,
+  atrLen: 14,
+  slBufferAtr: 0.05,
+  minRiskAtr: 0.10,
+  maxRiskAtr: 8,
+  sessionStartUTC: 0,
+  sessionEndUTC: 24,
   cooldownMin: 30,
   maxPerDay: 3,
-  emaFast: 21,
-  emaSlow: 100,
-  atrLen: 14,
-  swingLookback: 8,
-  sweepLookback: 12,
-  fvgLookback: 8,
-  slAtrBuffer: 0.15,
-  minRiskAtr: 0.25,
-  maxRiskAtr: 2.5,
-  minDisplacementBodyAtr: 0.45
+  setupExpiryMin: 240
 };
 
 function toMs(time) {
   if (typeof time !== "string") return NaN;
-  const normalized = time.includes("T") ? time : time.replace(" ", "T") + "Z";
+  const normalized = time.includes("T")
+    ? time
+    : time.replace(" ", "T") + "Z";
   const result = Date.parse(normalized);
   return Number.isFinite(result) ? result : NaN;
 }
 
-function ema(values, len) {
-  const out = [];
-  const k = 2 / (len + 1);
-  let previous;
-  for (let i = 0; i < values.length; i++) {
-    const value = Number(values[i]);
-    if (!Number.isFinite(value)) { out.push(null); continue; }
-    previous = i === 0 ? value : value * k + previous * (1 - k);
-    out.push(previous);
-  }
-  return out;
+function validCandles(candles) {
+  if (!Array.isArray(candles)) return [];
+
+  return candles
+    .filter(c =>
+      c &&
+      Number.isFinite(toMs(c.time)) &&
+      [c.open, c.high, c.low, c.close].every(Number.isFinite) &&
+      c.high >= Math.max(c.open, c.close, c.low) &&
+      c.low <= Math.min(c.open, c.close, c.high)
+    )
+    .sort((a, b) => toMs(a.time) - toMs(b.time));
 }
 
 function atr(candles, len = CFG.atrLen) {
-  const out = new Array(candles.length).fill(null);
-  let previousATR = null;
+  const result = new Array(candles.length).fill(null);
+  let previous = null;
   let sum = 0;
+
   for (let i = 1; i < candles.length; i++) {
-    const c = candles[i], p = candles[i - 1];
-    const tr = Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
+    const c = candles[i];
+    const p = candles[i - 1];
+
+    const tr = Math.max(
+      c.high - c.low,
+      Math.abs(c.high - p.close),
+      Math.abs(c.low - p.close)
+    );
+
     if (i <= len) {
       sum += tr;
-      if (i === len) { previousATR = sum / len; out[i] = previousATR; }
+      if (i === len) {
+        previous = sum / len;
+        result[i] = previous;
+      }
     } else {
-      previousATR = (previousATR * (len - 1) + tr) / len;
-      out[i] = previousATR;
+      previous = (previous * (len - 1) + tr) / len;
+      result[i] = previous;
     }
   }
-  return out;
+
+  return result;
 }
 
-function validCandles(candles) {
-  return Array.isArray(candles) ? candles.filter(c =>
-    c && Number.isFinite(toMs(c.time)) &&
-    [c.open, c.high, c.low, c.close].every(Number.isFinite) &&
-    c.high >= Math.max(c.open, c.close, c.low) &&
-    c.low <= Math.min(c.open, c.close, c.high)
-  ).sort((a, b) => toMs(a.time) - toMs(b.time)) : [];
+// Find a confirmed pivot. A pivot must have candles on both sides.
+function findSwingHigh(candles, index, left = 2, right = 2) {
+  if (index - left < 0 || index + right >= candles.length) {
+    return false;
+  }
+
+  const high = candles[index].high;
+
+  for (let i = index - left; i <= index + right; i++) {
+    if (i !== index && candles[i].high >= high) return false;
+  }
+
+  return true;
 }
 
-function trendAt(m15) {
-  if (m15.length < CFG.emaSlow + 5) return null;
-  const closes = m15.map(c => c.close);
-  const fast = ema(closes, CFG.emaFast);
-  const slow = ema(closes, CFG.emaSlow);
-  const i = m15.length - 1;
-  if (!Number.isFinite(fast[i]) || !Number.isFinite(slow[i])) return null;
-  if (closes[i] > slow[i] && fast[i] > slow[i] && fast[i] > fast[i - 3]) return "BUY";
-  if (closes[i] < slow[i] && fast[i] < slow[i] && fast[i] < fast[i - 3]) return "SELL";
+function findSwingLow(candles, index, left = 2, right = 2) {
+  if (index - left < 0 || index + right >= candles.length) {
+    return false;
+  }
+
+  const low = candles[index].low;
+
+  for (let i = index - left; i <= index + right; i++) {
+    if (i !== index && candles[i].low <= low) return false;
+  }
+
+  return true;
+}
+
+function getSwingLevels(candles, end, lookback = CFG.liquidityLookback) {
+  const start = Math.max(2, end - lookback);
+  const highs = [];
+  const lows = [];
+
+  for (let i = start; i <= end - 2; i++) {
+    if (findSwingHigh(candles, i)) {
+      highs.push({ price: candles[i].high, index: i });
+    }
+
+    if (findSwingLow(candles, i)) {
+      lows.push({ price: candles[i].low, index: i });
+    }
+  }
+
+  return { highs, lows };
+}
+
+function findNearestTarget(levels, entry, side) {
+  const candidates = levels
+    .map(level => level.price)
+    .filter(price =>
+      side === "BUY" ? price > entry : price < entry
+    );
+
+  if (!candidates.length) return null;
+
+  return side === "BUY"
+    ? Math.min(...candidates)
+    : Math.max(...candidates);
+}
+
+function detectSetup(input, cfg = CFG) {
+  const candles = validCandles(input);
+
+  if (candles.length < Math.max(cfg.swingLookback, 40)) {
+    return null;
+  }
+
+  const end = candles.length - 1;
+  const current = candles[end];
+  const currentTime = toMs(current.time);
+  const atrValues = atr(candles, cfg.atrLen);
+  const currentAtr = atrValues[end];
+
+  if (!Number.isFinite(currentAtr) || currentAtr <= 0) {
+    return null;
+  }
+
+  const swings = getSwingLevels(candles, end, cfg.liquidityLookback);
+
+  // Use a confirmed liquidity level before the latest sweep candle.
+  const sweepStart = Math.max(4, end - cfg.sweepSearchBars);
+
+  for (let s = end - 2; s >= sweepStart; s--) {
+    const earlierHighs = swings.highs.filter(level => level.index < s);
+    const earlierLows = swings.lows.filter(level => level.index < s);
+
+    const sweepCandle = candles[s];
+
+    // Look for the most recent confirmed swing liquidity.
+    const highLevel = earlierHighs.length
+      ? earlierHighs[earlierHighs.length - 1]
+      : null;
+
+    const lowLevel = earlierLows.length
+      ? earlierLows[earlierLows.length - 1]
+      : null;
+
+    let side = null;
+    let sweptLevel = null;
+
+    // BUY: price takes sell-side liquidity, then closes back above it.
+    if (
+      lowLevel &&
+      sweepCandle.low < lowLevel.price &&
+      sweepCandle.close > lowLevel.price
+    ) {
+      side = "BUY";
+      sweptLevel = lowLevel.price;
+    }
+
+    // SELL: price takes buy-side liquidity, then closes back below it.
+    if (
+      !side &&
+      highLevel &&
+      sweepCandle.high > highLevel.price &&
+      sweepCandle.close < highLevel.price
+    ) {
+      side = "SELL";
+      sweptLevel = highLevel.price;
+    }
+
+    if (!side) continue;
+
+    // Step 3 + 4: determine direction and wait for an MSS close.
+    const mssEnd = Math.min(end, s + cfg.mssLookback);
+    let mssIndex = -1;
+    let brokenLevel = null;
+
+    for (let j = s + 1; j <= mssEnd; j++) {
+      const structureStart = Math.max(0, j - cfg.mssLookback);
+      const structureCandles = candles.slice(structureStart, j);
+
+      if (structureCandles.length < 2) continue;
+
+      if (side === "BUY") {
+        const previousHigh = Math.max(
+          ...structureCandles.map(c => c.high)
+        );
+
+        if (candles[j].close > previousHigh) {
+          mssIndex = j;
+          brokenLevel = previousHigh;
+          break;
+        }
+      } else {
+        const previousLow = Math.min(
+          ...structureCandles.map(c => c.low)
+        );
+
+        if (candles[j].close < previousLow) {
+          mssIndex = j;
+          brokenLevel = previousLow;
+          break;
+        }
+      }
+    }
+
+    if (mssIndex < 0) continue;
+
+    // Step 5: last candle against the trade direction before MSS.
+    let opposingIndex = -1;
+    const opposingStart = Math.max(
+      s,
+      mssIndex - cfg.opposingCandleSearchBars
+    );
+
+    for (let k = mssIndex - 1; k >= opposingStart; k--) {
+      const c = candles[k];
+
+      if (side === "BUY" && c.close < c.open) {
+        opposingIndex = k;
+        break;
+      }
+
+      if (side === "SELL" && c.close > c.open) {
+        opposingIndex = k;
+        break;
+      }
+    }
+
+    if (opposingIndex < 0) continue;
+
+    const opposing = candles[opposingIndex];
+
+    // Step 6: midpoint of the last opposing candle.
+    const entry = (opposing.high + opposing.low) / 2;
+    const buffer = currentAtr * cfg.slBufferAtr;
+
+    const sl = side === "BUY"
+      ? opposing.low - buffer
+      : opposing.high + buffer;
+
+    const risk = Math.abs(entry - sl);
+
+    if (
+      !Number.isFinite(risk) ||
+      risk < currentAtr * cfg.minRiskAtr ||
+      risk > currentAtr * cfg.maxRiskAtr
+    ) {
+      continue;
+    }
+
+    // Step 7: target the nearest confirmed opposing-side liquidity.
+    const targetLevels = side === "BUY"
+      ? swings.highs.filter(level => level.index < s)
+      : swings.lows.filter(level => level.index < s);
+
+    const tp = findNearestTarget(targetLevels, entry, side);
+
+    if (!Number.isFinite(tp)) continue;
+
+    // Target must be beyond entry and on the profitable side of the trade.
+    if (
+      (side === "BUY" && tp <= entry) ||
+      (side === "SELL" && tp >= entry)
+    ) {
+      continue;
+    }
+
+    const rr = Math.abs(tp - entry) / risk;
+
+    // Don't impose a fixed RR requirement: TP is opposing-side liquidity.
+    const setupTime = candles[mssIndex].time;
+
+    return {
+      side,
+      time: current.time,
+      setupTime,
+      sweepTime: sweepCandle.time,
+      mssTime: setupTime,
+      opposingCandleTime: opposing.time,
+      entry,
+      sl,
+      tp,
+      rr: Number(rr.toFixed(2)),
+      atr: Number(currentAtr.toFixed(2)),
+      sweptLevel,
+      brokenLevel,
+      opposingCandle: {
+        open: opposing.open,
+        high: opposing.high,
+        low: opposing.low,
+        close: opposing.close
+      },
+      strategy: "M5 liquidity sweep + MSS + 50% opposing candle + opposing liquidity TP"
+    };
+  }
+
   return null;
 }
 
-function averageBody(candles, end, count = 10) {
-  const start = Math.max(0, end - count);
-  const bodies = candles.slice(start, end).map(c => Math.abs(c.close - c.open));
-  return bodies.length ? bodies.reduce((a, b) => a + b, 0) / bodies.length : 0;
-}
+function evaluateSniper(
+  m15Input,
+  m5Input,
+  m1Input,
+  state = { lastSignalMs: 0, countByDay: {} },
+  cfg = CFG
+) {
+  // Compatibility with server.js signature:
+  // M15 and M1 are deliberately ignored. The strategy uses M5 only.
+  const candles = validCandles(m5Input);
 
-function findM5Setup(m5, side) {
-  // Recent liquidity sweep followed by a close through short-term structure,
-  // with a directional displacement candle and a three-candle FVG.
-  if (m5.length < 30) return null;
-  const end = m5.length - 1;
-  const start = Math.max(2, end - CFG.sweepLookback);
-  const atrs = atr(m5, CFG.atrLen);
-  const currentAtr = atrs[end];
-  if (!Number.isFinite(currentAtr) || currentAtr <= 0) return null;
+  if (candles.length < 40) return null;
 
-  for (let s = end - 2; s >= start; s--) {
-    const beforeStart = Math.max(0, s - CFG.swingLookback);
-    const prior = m5.slice(beforeStart, s);
-    if (prior.length < 4) continue;
-    const priorHigh = Math.max(...prior.map(c => c.high));
-    const priorLow = Math.min(...prior.map(c => c.low));
-    const sweep = m5[s];
+  const last = candles[candles.length - 1];
+  const timestamp = toMs(last.time);
 
-    if (side === "BUY") {
-      if (!(sweep.low < priorLow && sweep.close > priorLow)) continue;
-      for (let j = s + 1; j <= Math.min(end, s + 3); j++) {
-        const structureHigh = Math.max(...m5.slice(Math.max(0, s - 4), s).map(c => c.high));
-        const c = m5[j];
-        const body = Math.abs(c.close - c.open);
-        if (c.close <= structureHigh || c.close <= c.open || body < currentAtr * CFG.minDisplacementBodyAtr) continue;
-        // Bullish FVG: low of current candle above high two candles earlier.
-        let fvg = null;
-        for (let k = Math.max(s + 2, j - 2); k <= j; k++) {
-          if (k >= 2 && m5[k].low > m5[k - 2].high) {
-            fvg = { low: m5[k - 2].high, high: m5[k].low, time: m5[k].time };
-          }
-        }
-        if (fvg) return { side, sweep: sweep.low, structure: structureHigh, fvg, atr: currentAtr, setupTime: c.time };
-      }
-    } else {
-      if (!(sweep.high > priorHigh && sweep.close < priorHigh)) continue;
-      for (let j = s + 1; j <= Math.min(end, s + 3); j++) {
-        const structureLow = Math.min(...m5.slice(Math.max(0, s - 4), s).map(c => c.low));
-        const c = m5[j];
-        const body = Math.abs(c.close - c.open);
-        if (c.close >= structureLow || c.close >= c.open || body < currentAtr * CFG.minDisplacementBodyAtr) continue;
-        let fvg = null;
-        for (let k = Math.max(s + 2, j - 2); k <= j; k++) {
-          if (k >= 2 && m5[k].high < m5[k - 2].low) {
-            fvg = { low: m5[k].high, high: m5[k - 2].low, time: m5[k].time };
-          }
-        }
-        if (fvg) return { side, sweep: sweep.high, structure: structureLow, fvg, atr: currentAtr, setupTime: c.time };
-      }
-    }
-  }
-  return null;
-}
-
-function m1Confirmation(m1, setup) {
-  if (m1.length < 20) return null;
-  const c = m1[m1.length - 1];
-  const p = m1[m1.length - 2];
-  const fvg = setup.fvg;
-  const overlaps = c.low <= fvg.high && c.high >= fvg.low;
-  if (!overlaps) return null;
-
-  if (setup.side === "BUY") {
-    if (c.close <= c.open || c.close <= fvg.low || c.close <= p.high) return null;
-  } else {
-    if (c.close >= c.open || c.close >= fvg.high || c.close >= p.low) return null;
-  }
-  return c;
-}
-
-function evaluateSniper(m15Input, m5Input, m1Input, state = { lastSignalMs: 0, countByDay: {} }, cfg = CFG) {
-  const m15 = validCandles(m15Input), m5 = validCandles(m5Input), m1 = validCandles(m1Input);
-  if (m15.length < cfg.emaSlow + 5 || m5.length < 30 || m1.length < 20) return null;
-
-  const candle = m1[m1.length - 1];
-  const timestamp = toMs(candle.time);
   if (!Number.isFinite(timestamp)) return null;
+
   const hour = new Date(timestamp).getUTCHours();
-  if (hour < cfg.sessionStartUTC || hour >= cfg.sessionEndUTC) return null;
+
+  if (hour < cfg.sessionStartUTC || hour >= cfg.sessionEndUTC) {
+    return null;
+  }
 
   state.lastSignalMs = Number(state.lastSignalMs) || 0;
   state.countByDay = state.countByDay || {};
-  if (timestamp - state.lastSignalMs < cfg.cooldownMin * 60000) return null;
+
+  if (timestamp - state.lastSignalMs < cfg.cooldownMin * 60000) {
+    return null;
+  }
+
   const day = new Date(timestamp).toISOString().slice(0, 10);
-  if ((state.countByDay[day] || 0) >= cfg.maxPerDay) return null;
 
-  const side = trendAt(m15);
-  if (!side) return null;
+  if ((state.countByDay[day] || 0) >= cfg.maxPerDay) {
+    return null;
+  }
 
-  // M5 must agree with the current M15 trend and provide sweep + shift + FVG.
-  const setup = findM5Setup(m5, side);
+  const setup = detectSetup(candles, cfg);
+
   if (!setup) return null;
 
-  // Do not use an old setup: require its M5 setup candle to be recent.
-  const setupAge = timestamp - toMs(setup.setupTime);
-  if (!Number.isFinite(setupAge) || setupAge < 0 || setupAge > 20 * 60000) return null;
+  // Do not repeat the same setup on every polling cycle.
+  const setupId = `${setup.side}:${setup.mssTime}:${setup.opposingCandleTime}`;
 
-  const confirmation = m1Confirmation(m1, setup);
-  if (!confirmation) return null;
+  if (state.lastSetupId === setupId) return null;
 
-  const currentAtrArr = atr(m1, cfg.atrLen);
-  const currentAtr = currentAtrArr[currentAtrArr.length - 1];
-  if (!Number.isFinite(currentAtr) || currentAtr <= 0) return null;
+  state.lastSetupId = setupId;
 
-  const entry = confirmation.close;
-  const buffer = currentAtr * cfg.slAtrBuffer;
-  const rawSL = side === "BUY" ? Math.min(setup.sweep, confirmation.low) - buffer : Math.max(setup.sweep, confirmation.high) + buffer;
-  const risk = Math.abs(entry - rawSL);
-  if (!Number.isFinite(risk) || risk < currentAtr * cfg.minRiskAtr || risk > currentAtr * cfg.maxRiskAtr) return null;
-
-  const sl = rawSL;
-  const tp = side === "BUY" ? entry + risk * cfg.rr : entry - risk * cfg.rr;
-  return {
-    side, time: candle.time, entry, sl, tp, rr: cfg.rr,
-    rsi: null, atr: Math.round(currentAtr * 100) / 100,
-    strategy: "M15 trend + M5 sweep/CHOCH/FVG + M1 retest",
-    setupTime: setup.setupTime,
-    fvg: setup.fvg
-  };
+  return setup;
 }
 
 function checkSignal(m15, m5, m1, state, cfg = CFG) {
   return evaluateSniper(m15, m5, m1, state, cfg);
 }
 
-module.exports = { CFG, checkSignal, evaluateSniper, toMs, validCandles };
+module.exports = {
+  CFG,
+  checkSignal,
+  evaluateSniper,
+  toMs,
+  validCandles,
+  atr,
+  detectSetup
+};
