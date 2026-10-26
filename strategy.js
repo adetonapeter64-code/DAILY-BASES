@@ -1,36 +1,34 @@
-
 "use strict";
 
 // 🤖 BOT.XAU SNIPER ENTRY
-// XAUUSD ONLY — M5 LIQUIDITY / MSS STRATEGY
+// XAUUSD ONLY — M5 LIQUIDITY SWEEP + MSS + ORDER BLOCK (buy and sell)
 //
-// 1. Identify liquidity.
-// 2. Wait for a liquidity sweep.
-// 3. Determine direction from the sweep.
-// 4. Wait for MSS.
-// 5. Find the last opposing candle before MSS.
-// 6. Entry at 50% of that candle; SL beyond its extreme.
-// 7. TP at opposing-side liquidity.
-// 8. Track the simulated trade until TP or SL.
+// Route (sell side; buy side is the exact mirror):
+//  1. Liquidity point : a swing high that has not been exceeded yet.
+//  2. Sweep           : a candle wicks above it and CLOSES back below it.
+//  3. Structure       : the swing low formed between the liquidity high and the sweep = MSS level.
+//  4. MSS             : a candle CLOSES below the MSS level.
+//  5. Order block     : the last bullish candle (against the trade) above the MSS, before the break.
+//  6. Entry / SL      : limit at 50% of that candle, stop slightly above its high.
+//  7. Target          : opposite-side liquidity (nearest unswept swing low).
+//  8. Let it run      : fixed SL and TP (tracked by server.js), no trailing, no breakeven.
 //
-// Candles: closed, oldest to newest. Times are UTC.
+// Drop-in replacement for the old strategy.js: same exports, same signal fields.
+// Candles: closed, oldest to newest, { time, open, high, low, close }. Times are UTC.
 
 const CFG = {
   timeframe: "5min",
-  swingLookback: 30,
-  mssLookback: 8,
-  sweepSearchBars: 8,
-  opposingCandleSearchBars: 8,
-  liquidityLookback: 80,
+  pivotLeft: 3,          // candles to the left a swing high must beat
+  liquidityLookback: 80, // max distance (candles) from the liquidity high to the sweep
+  targetPivot: 10,       // strength of the swing low used as opposite-side liquidity
+  recentBars: 3,         // only signal when the MSS break is within the last N closed candles
   atrLen: 14,
-  slBufferAtr: 0.05,
-  minRiskAtr: 0.10,
-  maxRiskAtr: 8,
+  slBufferAtr: 0.05,     // "slightly above the high" = 5% of ATR
   sessionStartUTC: 0,
   sessionEndUTC: 24,
-  cooldownMin: 30,
+  cooldownMin: 30,       // delivery limits from the old file, see notes: set 0 / 999 to disable
   maxPerDay: 3,
-  setupExpiryMin: 240
+  setupExpiryMin: 240    // used by server.js to expire a limit that never fills
 };
 
 function toMs(time) {
@@ -86,256 +84,128 @@ function atr(candles, len = CFG.atrLen) {
   return result;
 }
 
-// Find a confirmed pivot. A pivot must have candles on both sides.
-function findSwingHigh(candles, index, left = 2, right = 2) {
-  if (index - left < 0 || index + right >= candles.length) {
-    return false;
-  }
+const maxOf = (arr, a, b) => Math.max(...arr.slice(a, b));
+const minOf = (arr, a, b) => Math.min(...arr.slice(a, b));
 
-  const high = candles[index].high;
+// Sell-side route on plain arrays. The buy side runs this on mirrored (negated) prices.
+function findSellSetups(o, h, l, c, slBuffer, cfg) {
+  const LEFT = cfg.pivotLeft;
+  const P = cfg.targetPivot;
+  const n = h.length;
+  const out = [];
 
-  for (let i = index - left; i <= index + right; i++) {
-    if (i !== index && candles[i].high >= high) return false;
-  }
-
-  return true;
-}
-
-function findSwingLow(candles, index, left = 2, right = 2) {
-  if (index - left < 0 || index + right >= candles.length) {
-    return false;
-  }
-
-  const low = candles[index].low;
-
-  for (let i = index - left; i <= index + right; i++) {
-    if (i !== index && candles[i].low <= low) return false;
-  }
-
-  return true;
-}
-
-function getSwingLevels(candles, end, lookback = CFG.liquidityLookback) {
-  const start = Math.max(2, end - lookback);
-  const highs = [];
-  const lows = [];
-
-  for (let i = start; i <= end - 2; i++) {
-    if (findSwingHigh(candles, i)) {
-      highs.push({ price: candles[i].high, index: i });
+  for (let s = Math.max(LEFT + 3, n - cfg.liquidityLookback); s < n - 1; s++) {
+    // 1 + 2. liquidity high swept by candle s (wick above, close back below)
+    let liq = null;
+    for (let i = s - 3; i >= Math.max(LEFT, s - cfg.liquidityLookback); i--) {
+      if (h[i] <= maxOf(h, i - LEFT, i)) continue;   // not a swing high
+      if (h[i] < maxOf(h, i + 1, s)) continue;       // already exceeded before s
+      if (h[i] < h[s] && c[s] < h[i]) { liq = i; break; }
     }
+    if (liq === null) continue;
 
-    if (findSwingLow(candles, i)) {
-      lows.push({ price: candles[i].low, index: i });
+    // 3. MSS level = swing low between the liquidity high and the sweep
+    const mss = minOf(l, liq + 1, s);
+
+    // 4. MSS = first candle that CLOSES below it (invalid if the sweep high is taken out first)
+    let b = null;
+    for (let k = s + 1; k < n; k++) {
+      if (h[k] > h[s]) break;
+      if (c[k] < mss) { b = k; break; }
     }
+    if (b === null) continue;
+
+    // 5. order block = last bullish candle before the break, sitting above the MSS
+    let ob = null;
+    for (let k = b - 1; k >= s; k--) {
+      if (c[k] > o[k]) { ob = k; break; }
+    }
+    if (ob === null || l[ob] <= mss) continue;
+
+    // 6. entry at 50% of the candle, stop slightly above its high
+    const entry = (h[ob] + l[ob]) / 2;
+    const sl = h[ob] + slBuffer;
+
+    // 7. target = nearest unswept swing low below entry (opposite-side liquidity)
+    let tp = null;
+    for (let j = b - P - 1; j >= P; j--) {
+      if (l[j] < minOf(l, j - P, j) &&
+          l[j] < minOf(l, j + 1, j + P + 1) &&
+          l[j] < minOf(l, j + 1, b + 1) &&
+          l[j] < entry) { tp = l[j]; break; }
+    }
+    if (tp === null || !(tp < entry && entry < sl)) continue;
+
+    out.push({ sweepIndex: s, mssIndex: b, opposingIndex: ob, liq: h[liq], mss, entry, sl, tp });
   }
 
-  return { highs, lows };
-}
-
-function findNearestTarget(levels, entry, side) {
-  const candidates = levels
-    .map(level => level.price)
-    .filter(price =>
-      side === "BUY" ? price > entry : price < entry
-    );
-
-  if (!candidates.length) return null;
-
-  return side === "BUY"
-    ? Math.min(...candidates)
-    : Math.max(...candidates);
+  return out;
 }
 
 function detectSetup(input, cfg = CFG) {
   const candles = validCandles(input);
-
-  if (candles.length < Math.max(cfg.swingLookback, 40)) {
-    return null;
-  }
+  if (candles.length < 40) return null;
 
   const end = candles.length - 1;
-  const current = candles[end];
-  const currentTime = toMs(current.time);
   const atrValues = atr(candles, cfg.atrLen);
   const currentAtr = atrValues[end];
+  if (!Number.isFinite(currentAtr) || currentAtr <= 0) return null;
 
-  if (!Number.isFinite(currentAtr) || currentAtr <= 0) {
-    return null;
+  const slBuffer = currentAtr * cfg.slBufferAtr;
+
+  const o = candles.map(x => x.open);
+  const h = candles.map(x => x.high);
+  const l = candles.map(x => x.low);
+  const c = candles.map(x => x.close);
+
+  const found = [];
+
+  for (const s of findSellSetups(o, h, l, c, slBuffer, cfg)) {
+    found.push({ ...s, side: "SELL" });
   }
 
-  const swings = getSwingLevels(candles, end, cfg.liquidityLookback);
-
-  // Use a confirmed liquidity level before the latest sweep candle.
-  const sweepStart = Math.max(4, end - cfg.sweepSearchBars);
-
-  for (let s = end - 2; s >= sweepStart; s--) {
-    const earlierHighs = swings.highs.filter(level => level.index < s);
-    const earlierLows = swings.lows.filter(level => level.index < s);
-
-    const sweepCandle = candles[s];
-
-    // Look for the most recent confirmed swing liquidity.
-    const highLevel = earlierHighs.length
-      ? earlierHighs[earlierHighs.length - 1]
-      : null;
-
-    const lowLevel = earlierLows.length
-      ? earlierLows[earlierLows.length - 1]
-      : null;
-
-    let side = null;
-    let sweptLevel = null;
-
-    // BUY: price takes sell-side liquidity, then closes back above it.
-    if (
-      lowLevel &&
-      sweepCandle.low < lowLevel.price &&
-      sweepCandle.close > lowLevel.price
-    ) {
-      side = "BUY";
-      sweptLevel = lowLevel.price;
-    }
-
-    // SELL: price takes buy-side liquidity, then closes back below it.
-    if (
-      !side &&
-      highLevel &&
-      sweepCandle.high > highLevel.price &&
-      sweepCandle.close < highLevel.price
-    ) {
-      side = "SELL";
-      sweptLevel = highLevel.price;
-    }
-
-    if (!side) continue;
-
-    // Step 3 + 4: determine direction and wait for an MSS close.
-    const mssEnd = Math.min(end, s + cfg.mssLookback);
-    let mssIndex = -1;
-    let brokenLevel = null;
-
-    for (let j = s + 1; j <= mssEnd; j++) {
-      const structureStart = Math.max(0, j - cfg.mssLookback);
-      const structureCandles = candles.slice(structureStart, j);
-
-      if (structureCandles.length < 2) continue;
-
-      if (side === "BUY") {
-        const previousHigh = Math.max(
-          ...structureCandles.map(c => c.high)
-        );
-
-        if (candles[j].close > previousHigh) {
-          mssIndex = j;
-          brokenLevel = previousHigh;
-          break;
-        }
-      } else {
-        const previousLow = Math.min(
-          ...structureCandles.map(c => c.low)
-        );
-
-        if (candles[j].close < previousLow) {
-          mssIndex = j;
-          brokenLevel = previousLow;
-          break;
-        }
-      }
-    }
-
-    if (mssIndex < 0) continue;
-
-    // Step 5: last candle against the trade direction before MSS.
-    let opposingIndex = -1;
-    const opposingStart = Math.max(
-      s,
-      mssIndex - cfg.opposingCandleSearchBars
-    );
-
-    for (let k = mssIndex - 1; k >= opposingStart; k--) {
-      const c = candles[k];
-
-      if (side === "BUY" && c.close < c.open) {
-        opposingIndex = k;
-        break;
-      }
-
-      if (side === "SELL" && c.close > c.open) {
-        opposingIndex = k;
-        break;
-      }
-    }
-
-    if (opposingIndex < 0) continue;
-
-    const opposing = candles[opposingIndex];
-
-    // Step 6: midpoint of the last opposing candle.
-    const entry = (opposing.high + opposing.low) / 2;
-    const buffer = currentAtr * cfg.slBufferAtr;
-
-    const sl = side === "BUY"
-      ? opposing.low - buffer
-      : opposing.high + buffer;
-
-    const risk = Math.abs(entry - sl);
-
-    if (
-      !Number.isFinite(risk) ||
-      risk < currentAtr * cfg.minRiskAtr ||
-      risk > currentAtr * cfg.maxRiskAtr
-    ) {
-      continue;
-    }
-
-    // Step 7: target the nearest confirmed opposing-side liquidity.
-    const targetLevels = side === "BUY"
-      ? swings.highs.filter(level => level.index < s)
-      : swings.lows.filter(level => level.index < s);
-
-    const tp = findNearestTarget(targetLevels, entry, side);
-
-    if (!Number.isFinite(tp)) continue;
-
-    // Target must be beyond entry and on the profitable side of the trade.
-    if (
-      (side === "BUY" && tp <= entry) ||
-      (side === "SELL" && tp >= entry)
-    ) {
-      continue;
-    }
-
-    const rr = Math.abs(tp - entry) / risk;
-
-    // Don't impose a fixed RR requirement: TP is opposing-side liquidity.
-    const setupTime = candles[mssIndex].time;
-
-    return {
-      side,
-      time: current.time,
-      setupTime,
-      sweepTime: sweepCandle.time,
-      mssTime: setupTime,
-      opposingCandleTime: opposing.time,
-      entry,
-      sl,
-      tp,
-      rr: Number(rr.toFixed(2)),
-      atr: Number(currentAtr.toFixed(2)),
-      sweptLevel,
-      brokenLevel,
-      opposingCandle: {
-        open: opposing.open,
-        high: opposing.high,
-        low: opposing.low,
-        close: opposing.close
-      },
-      strategy: "M5 liquidity sweep + MSS + 50% opposing candle + opposing liquidity TP"
-    };
+  // BUY = exact mirror: negate prices, swap highs and lows, run the same route.
+  const mo = o.map(v => -v), mh = l.map(v => -v), ml = h.map(v => -v), mc = c.map(v => -v);
+  for (const s of findSellSetups(mo, mh, ml, mc, slBuffer, cfg)) {
+    found.push({
+      ...s, side: "BUY",
+      liq: -s.liq, mss: -s.mss, entry: -s.entry, sl: -s.sl, tp: -s.tp
+    });
   }
 
-  return null;
+  // Only setups whose MSS break just happened (price may already have run on older ones).
+  const fresh = found.filter(s => s.mssIndex >= end - cfg.recentBars);
+  if (!fresh.length) return null;
+
+  fresh.sort((a, b) => b.mssIndex - a.mssIndex);
+  const pick = fresh[0];
+
+  const opposing = candles[pick.opposingIndex];
+  const risk = Math.abs(pick.entry - pick.sl);
+  const rr = Math.abs(pick.tp - pick.entry) / risk;
+
+  return {
+    side: pick.side,
+    time: candles[end].time,
+    setupTime: candles[pick.mssIndex].time,
+    sweepTime: candles[pick.sweepIndex].time,
+    mssTime: candles[pick.mssIndex].time,
+    opposingCandleTime: opposing.time,
+    entry: pick.entry,
+    sl: pick.sl,
+    tp: pick.tp,
+    rr: Number(rr.toFixed(2)),
+    atr: Number(currentAtr.toFixed(2)),
+    sweptLevel: pick.liq,
+    brokenLevel: pick.mss,
+    opposingCandle: {
+      open: opposing.open,
+      high: opposing.high,
+      low: opposing.low,
+      close: opposing.close
+    },
+    strategy: "M5 liquidity sweep + MSS + 50% order block + opposing liquidity TP"
+  };
 }
 
 function evaluateSniper(
@@ -345,45 +215,31 @@ function evaluateSniper(
   state = { lastSignalMs: 0, countByDay: {} },
   cfg = CFG
 ) {
-  // Compatibility with server.js signature:
-  // M15 and M1 are deliberately ignored. The strategy uses M5 only.
+  // Compatibility with server.js signature: M15 and M1 are ignored. M5 only.
   const candles = validCandles(m5Input);
-
   if (candles.length < 40) return null;
 
   const last = candles[candles.length - 1];
   const timestamp = toMs(last.time);
-
   if (!Number.isFinite(timestamp)) return null;
 
   const hour = new Date(timestamp).getUTCHours();
-
-  if (hour < cfg.sessionStartUTC || hour >= cfg.sessionEndUTC) {
-    return null;
-  }
+  if (hour < cfg.sessionStartUTC || hour >= cfg.sessionEndUTC) return null;
 
   state.lastSignalMs = Number(state.lastSignalMs) || 0;
   state.countByDay = state.countByDay || {};
 
-  if (timestamp - state.lastSignalMs < cfg.cooldownMin * 60000) {
-    return null;
-  }
+  if (timestamp - state.lastSignalMs < cfg.cooldownMin * 60000) return null;
 
   const day = new Date(timestamp).toISOString().slice(0, 10);
-
-  if ((state.countByDay[day] || 0) >= cfg.maxPerDay) {
-    return null;
-  }
+  if ((state.countByDay[day] || 0) >= cfg.maxPerDay) return null;
 
   const setup = detectSetup(candles, cfg);
-
   if (!setup) return null;
 
   // Do not repeat the same setup on every polling cycle.
   const setupId = `${setup.side}:${setup.mssTime}:${setup.opposingCandleTime}`;
-
   if (state.lastSetupId === setupId) return null;
-
   state.lastSetupId = setupId;
 
   return setup;
